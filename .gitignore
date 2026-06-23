@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+
+# Credentialed MIMIC-IV data and ANY patient-level derivative.
+# Redistribution is prohibited by the PhysioNet Data Use Agreement.
+data/
+mimic-iv-3.1/
+MedM2T/
+
+# Internal working docs — not part of the public release
+CLAUDE.md
+notes/
+notebooks/
+models/
+learning/
+
+# Python env / caches / editor junk
+.venv/
+__pycache__/
+*.pyc
+octave-workspace
+.DS_Store
