@@ -14,10 +14,14 @@ Split 6,304 train / 1,669 val / **2,027 test**. Metric: **test MAE in days**
 | 4 | Z only (LLM's own day estimate) | — | 2.82 | 2.57 |
 | **1** | **X + Z (1536-dim embedding)** | **RF** | **2.52** | 2.44 |
 | 1 | X + Z | Ridge | 2.53 | 2.49 |
-| 2 | X + 1 Stein-compressed score | LR | 2.53 | 2.68 |
-| 2 | X + 1 Stein-compressed score | RF | 2.58 | 2.72 |
+| 2 | X + 1 ridge-compressed score | LR | 2.53 | 2.68 |
+| 2 | X + 1 ridge-compressed score | RF | 2.58 | 2.72 |
+| 2b | X + 1 **literal Stein-moment** score | LR | 2.50 | — |
+| 2b | X + 1 literal Stein-moment score | RF | 2.51 | — |
 
-**Best: Case 1 (X+Z), RF — 2.52d.** Still the winner, still above the 2.31 bar.
+**Best: Case 2b (literal Stein) — 2.50d**, edging Case 1 (X+Z) at 2.52d; all
+within fold noise, all above the 2.31 bar. Case 2b picked the probe `arctan(0.5y)`
+at first order (`scripts/14b_case2_stein_literal.py`).
 
 ## What the 10× data changed
 - **The ranking held: Case 1 (X+Z) is best.** Adding the embedding still beats
@@ -41,16 +45,21 @@ Train-vs-test gap for the random forests:
 |------|-------|:---:|:---:|:---:|:---:|
 | 1 | RF | 1.28 | 2.52 | **1.24** | 1.11 |
 | 2 | RF | 2.02 | 2.58 | **0.55** | 1.48 |
+| 2b | RF | 2.17 | 2.51 | **0.33** | — |
 
 - **Case 1 RF still overfits** (gap 1.24): even with 10× data, the 1536 embedding
   columns + demographic one-hots give the forest room to memorize training stays.
 - **Case 2's compression now controls it** (gap 0.55, down from 1.48). At 1,074 the
   Stein score looked *more* overfit than Case 1 — that was noise. With real data the
   one-number compression does what it was designed to do: it kills the overfitting.
-- **But it doesn't win on test** (2.58 vs Case 1's 2.52). So compressing Z to a
-  single score buys generalization stability at the cost of a hair of accuracy — it
-  trades, it doesn't beat. Case 1 is still the better predictor; Case 2 is the better
-  *behaved* model.
+- **But the ridge-score Case 2 doesn't win on test** (2.58 vs Case 1's 2.52). So
+  *that* compression buys generalization stability at the cost of a hair of accuracy.
+- **Case 2b (literal Stein moment) gets both** (gap 0.33, test 2.51): finding the
+  single direction via an explicit Stein moment over probes — rather than a ridge
+  regression — keeps essentially all of Case 1's signal *and* overfits the least of
+  any model. First order dominated (second-order Hessian moment carried almost no
+  signal), and the bounded probes collapsed to ~linear, so the usable narrative
+  signal is close to a single linear index. Marginal on test, but the best-behaved.
 
 ## Takeaways for next steps
 - Case 1 (X+Z) is the architecture to keep developing.
