@@ -11,6 +11,7 @@ WHY THIS WAY: target is right-skewed -> Box-Cox (lambda on TRAIN only). Z is
 1536 wide columns -> Ridge needs regularization + standardized emb (scale-
 sensitive); RF needs neither. Everything fitted (lambda, one-hot categories, emb
 scaler, model hyperparameters) is fit on train and applied unchanged to val/test.
+Shared machinery (assemble, one-hot, Box-Cox, MAE-in-days, RF grid) is in _common.py.
 
 DELIBERATELY DOES NOT:
   - use llm_point_estimate / llm_answer from the base (that is step 12's job);
@@ -28,80 +29,36 @@ Inputs : data/12_baseline_llm_float.parquet  (base: target, split, emb_0..1535)
          data/05a_target.parquet             (source of the 7 demographics)
 Output : data/13_case1_x_plus_z__manifest.json  (no parquet)
 """
-from pathlib import Path
 import json
 import datetime as dt
 import numpy as np
 import pandas as pd
-from scipy.stats import boxcox
-from scipy.special import inv_boxcox
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
 
-OUT_ROOT = Path("/home/pierrectrd/LoS project/data")
+from _common import (OUT_ROOT, MEDM2T_MAE, NUM_COL, DEMO_COLS,
+                     log, assemble, split_parts, make_demo, boxcox_target,
+                     mae_real, best_rf_by_val, synthetic_demographics)
+
 BASE_NAME = "12_baseline_llm_float"
 DEMO_NAME = "05a_target"
 STEP_NAME = "13_case1_x_plus_z"
-SEED = 42
-
-NUM_COL  = "age_at_admission"
-CAT_COLS = ["first_careunit", "gender", "admission_type",
-            "insurance", "marital_status", "race"]
-DEMO_COLS = ["stay_id", NUM_COL] + CAT_COLS   # the ONLY cols taken from 05a (leak guard)
 
 RIDGE_ALPHAS = [1, 10, 100, 1000]
-RF_GRID = [(n, d) for n in (200, 500) for d in (None, 10, 20)]
 
 # reference bars for the printed table (days)
 REF_XONLY_RF = "step 11 X-only RF ~2.59-2.67"
 REF_Z_ALONE  = "step 12 Z-alone ~2.57"
-MEDM2T_MAE   = 2.31
-
-def log(msg): print(f"[{dt.datetime.now():%H:%M:%S}] {msg}")
-
-# ---- pure helpers (self-test exercises these without disk I/O) ----
-
-def assemble(df_base, df05a):
-    """Left-join demographics onto the embedding base, on stay_id. 1:1, no inflation."""
-    demo = df05a[DEMO_COLS]                        # drop every leaky 05a column here
-    out = df_base.merge(demo, on="stay_id", how="left")
-    assert len(out) == len(df_base), "row inflation on join (stay_id not 1:1)"
-    return out
-
-def make_demo(frame, ohe, fit=False):
-    """One-hot demographics + raw numeric age -> dense block."""
-    cat = frame[CAT_COLS].fillna("Unknown")        # missing categ -> explicit level
-    if fit:
-        ohe.fit(cat)
-    age = frame[[NUM_COL]].to_numpy(dtype=float)   # numeric, passed through (unscaled)
-    return np.hstack([age, ohe.transform(cat)])
-
-def mae_real(model, X, y_real, lam):
-    """Predict in Box-Cox space, invert to days, MAE vs raw real-day target."""
-    pred = inv_boxcox(model.predict(X), lam)
-    # ponytail: inv_boxcox is nan outside its domain (linear models extrapolate);
-    # floor non-finite + negatives to 0 days. ceiling = crude tail clip; upgrade =
-    # clip the transformed pred to the Box-Cox domain before inverting.
-    pred = np.clip(np.where(np.isfinite(pred), pred, 0.0), 0.0, None)
-    return float(np.mean(np.abs(pred - y_real)))
 
 def evaluate(df):
     """Full leakage-ordered pipeline on an assembled X+Z frame. Returns result dict."""
     emb_cols = [c for c in df.columns if c.startswith("emb_")]
     assert emb_cols, "no emb_* columns found in base"
-    parts = {s: df[df["split"] == s] for s in ("train", "val", "test")}
-    assert all(len(p) for p in parts.values()), "a split is empty"
+    parts = split_parts(df)
     assert parts["train"][NUM_COL].notna().all(), f"{NUM_COL} has NaN in train"
 
     # --- target: Box-Cox, lambda from TRAIN ONLY ---
-    y_tr_real = parts["train"]["remaining_los_days"].to_numpy(float)
-    assert y_tr_real.min() > 0, "train target not strictly positive (Box-Cox needs >0)"
-    y_tr_t, lam = boxcox(y_tr_real)
-    y_real = {s: parts[s]["remaining_los_days"].to_numpy(float) for s in parts}
-    y_t = {"train": y_tr_t,
-           "val":  boxcox(y_real["val"],  lmbda=lam),
-           "test": boxcox(y_real["test"], lmbda=lam)}
+    y_t, y_real, lam = boxcox_target(parts)
 
     # --- demographics: OneHot fit on TRAIN ONLY (same block for both models) ---
     ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
@@ -121,7 +78,7 @@ def evaluate(df):
     # --- Ridge: pick alpha by best val MAE-in-days ---
     best = None
     for a in RIDGE_ALPHAS:
-        m = Ridge(alpha=a, random_state=SEED).fit(X_ridge["train"], y_t["train"])
+        m = Ridge(alpha=a).fit(X_ridge["train"], y_t["train"])
         v = mae_real(m, X_ridge["val"], y_real["val"], lam)
         if best is None or v < best[0]:
             best = (v, a, m)
@@ -129,14 +86,7 @@ def evaluate(df):
     ridge_mae = {s: mae_real(ridge, X_ridge[s], y_real[s], lam) for s in parts}
 
     # --- RandomForest: pick (n_estimators, max_depth) by best val MAE-in-days ---
-    best = None
-    for n_est, depth in RF_GRID:
-        m = RandomForestRegressor(n_estimators=n_est, max_depth=depth,
-                                  random_state=SEED, n_jobs=-1).fit(X_rf["train"], y_t["train"])
-        v = mae_real(m, X_rf["val"], y_real["val"], lam)
-        if best is None or v < best[0]:
-            best = (v, n_est, depth, m)
-    _, n_est, depth, rf = best
+    rf, n_est, depth = best_rf_by_val(X_rf, y_t["train"], y_real, lam)
     rf_mae = {s: mae_real(rf, X_rf[s], y_real[s], lam) for s in parts}
 
     return {
@@ -167,17 +117,7 @@ def selftest():
         base[f"emb_{i}"] = rng.standard_normal(n)
     base["emb_0"] = 0.0  # constant column -> exercises StandardScaler zero-variance
 
-    cats = lambda opts: rng.choice(opts, n)
-    df05a = pd.DataFrame({
-        "stay_id": sid,
-        NUM_COL: rng.integers(18, 92, n).astype(float),
-        "first_careunit": cats(["MICU", "SICU"]), "gender": cats(["M", "F"]),
-        "admission_type": cats(["EW EMER.", "ELECTIVE"]), "insurance": cats(["Medicare", "Other"]),
-        "marital_status": cats(["SINGLE", "MARRIED"]), "race": cats(["WHITE", "BLACK"]),
-        "icu_los_days": rng.random(n), "outtime": "x",  # leaky cols assemble must drop
-        "in_hospital_death": 0, "last_careunit": "z",
-    })
-    df05a.loc[df05a["stay_id"] == "s0", "gender"] = np.nan  # exercises "Unknown" fill
+    df05a = synthetic_demographics(rng, sid)
 
     asm = assemble(base, df05a)
     assert not {"icu_los_days", "outtime", "in_hospital_death",

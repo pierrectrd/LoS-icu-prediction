@@ -24,7 +24,7 @@ def main():
     path = Path(arg)
     if not path.exists():
         path = OUT_ROOT / arg
-    df = pd.read_parquet(path, columns=None)
+    df = pd.read_parquet(path)
     if col not in df.columns:
         print(f"Column '{col}' not found. Available: {list(df.columns)[:20]}...")
         sys.exit(1)

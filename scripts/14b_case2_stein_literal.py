@@ -42,6 +42,8 @@ instead -- explicit moments + probe/order selection -- to see whether the litera
 estimator buys anything on real (non-Gaussian) embeddings. Expectation: the
 Gaussian assumption behind the moments does NOT hold for LLM embeddings, so this
 is a curiosity/benchmark, not necessarily an improvement over step 14's ridge.
+Shared machinery (assemble, one-hot, Box-Cox, MAE-in-days, score-stacking, RF
+grid) lives in _common.py.
 
 DELIBERATELY DOES NOT:
   - whiten the FULL 1536-dim residual (singular covariance); caps at PCA_COMPONENTS
@@ -60,39 +62,28 @@ Inputs : data/12_baseline_llm_float.parquet  (base: target, split, emb_0..1535)
          data/05a_target.parquet             (source of the 7 demographics)
 Output : data/14b_case2_stein_literal__manifest.json  (no parquet)
 """
-from pathlib import Path
 import json
 import datetime as dt
 import numpy as np
 import pandas as pd
-from scipy.stats import boxcox
-from scipy.special import inv_boxcox
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge, LinearRegression
-from sklearn.ensemble import RandomForestRegressor
 
-OUT_ROOT = Path("/home/pierrectrd/LoS project/data")
+from _common import (OUT_ROOT, SEED, MEDM2T_MAE, NUM_COL, DEMO_COLS,
+                     log, assemble, split_parts, make_demo, boxcox_target,
+                     mae_real, with_score, best_rf_by_val, synthetic_demographics)
+
 BASE_NAME = "12_baseline_llm_float"
 DEMO_NAME = "05a_target"
 STEP_NAME = "14b_case2_stein_literal"
-SEED = 42
-
-NUM_COL  = "age_at_admission"
-CAT_COLS = ["first_careunit", "gender", "admission_type",
-            "insurance", "marital_status", "race"]
-DEMO_COLS = ["stay_id", NUM_COL] + CAT_COLS   # ONLY cols taken from 05a (leak guard)
 
 RESID_ALPHA    = 1.0      # stage-1 nuisance ridge, FIXED (not tuned)
 PCA_COMPONENTS = 100      # whitened subspace size, FIXED (stability vs full 1536-dim)
 A_VALUES       = [0.5, 1.0, 2.0]   # scale param for the two bounded probes
-RF_GRID = [(n, d) for n in (200, 500) for d in (None, 10, 20)]
 
 REF_CASE2  = "step 14 X1+ridge-score: LR ~2.53 / RF ~2.58 (10k)"
 REF_CASE1  = "step 13 X+Z: Ridge ~2.53 / RF ~2.52 (10k)"
-MEDM2T_MAE = 2.31
-
-def log(msg): print(f"[{dt.datetime.now():%H:%M:%S}] {msg}")
 
 # ----------------------------- probe functions ------------------------------
 
@@ -106,29 +97,6 @@ def build_probes():
         cand.append((f"arctan({a}y)",        lambda y, a=a: np.arctan(a * y)))
         cand.append((f"{a}y^2/(1+{a}y^2)",   lambda y, a=a: (a * y**2) / (1.0 + a * y**2)))
     return cand
-
-# ---- pure helpers (shared shape with step 14; self-test exercises them) ----
-
-def assemble(df_base, df05a):
-    """Left-join demographics onto the embedding base on stay_id. 1:1, no inflation."""
-    demo = df05a[DEMO_COLS]                         # drop every leaky 05a column here
-    out = df_base.merge(demo, on="stay_id", how="left")
-    assert len(out) == len(df_base), "row inflation on join (stay_id not 1:1)"
-    return out
-
-def make_demo(frame, ohe, fit=False):
-    """One-hot demographics + raw numeric age -> dense block (X1)."""
-    cat = frame[CAT_COLS].fillna("Unknown")
-    if fit:
-        ohe.fit(cat)
-    age = frame[[NUM_COL]].to_numpy(dtype=float)
-    return np.hstack([age, ohe.transform(cat)])
-
-def mae_real(model, X, y_real, lam):
-    """Predict in Box-Cox space, invert to days, MAE vs raw real-day target."""
-    pred = inv_boxcox(model.predict(X), lam)
-    pred = np.clip(np.where(np.isfinite(pred), pred, 0.0), 0.0, None)
-    return float(np.mean(np.abs(pred - y_real)))
 
 def stein_direction(W_tr, Tvals, order):
     """Closed-form Stein direction from TRAIN whitened residual W_tr (Cov~I, mean~0)
@@ -150,17 +118,10 @@ def evaluate(df):
     """Literal-Stein pipeline (leakage-ordered). Returns a result dict."""
     emb_cols = [c for c in df.columns if c.startswith("emb_")]
     assert emb_cols, "no emb_* columns found in base"
-    parts = {s: df[df["split"] == s] for s in ("train", "val", "test")}
-    assert all(len(p) for p in parts.values()), "a split is empty"
+    parts = split_parts(df)
 
     # --- target: Box-Cox (lambda TRAIN-only), then standardize (TRAIN-only) ---
-    y_tr_real = parts["train"]["remaining_los_days"].to_numpy(float)
-    assert y_tr_real.min() > 0, "train target not strictly positive (Box-Cox needs >0)"
-    y_tr_t, lam = boxcox(y_tr_real)
-    y_real = {s: parts[s]["remaining_los_days"].to_numpy(float) for s in parts}
-    y_t = {"train": y_tr_t,
-           "val":  boxcox(y_real["val"],  lmbda=lam),
-           "test": boxcox(y_real["test"], lmbda=lam)}
+    y_t, y_real, lam = boxcox_target(parts)
     ymu, ysd = y_t["train"].mean(), y_t["train"].std()
     ys = {s: (y_t[s] - ymu) / ysd for s in parts}   # standardized target -> probe input
 
@@ -175,7 +136,7 @@ def evaluate(df):
     emb = {s: parts[s][emb_cols].to_numpy(float) for s in parts}
     scaler = StandardScaler().fit(emb["train"])
     emb_z = {s: scaler.transform(emb[s]) for s in parts}
-    resid = Ridge(alpha=RESID_ALPHA, random_state=SEED).fit(demo["train"], emb_z["train"])
+    resid = Ridge(alpha=RESID_ALPHA).fit(demo["train"], emb_z["train"])
     Zprime = {s: emb_z[s] - resid.predict(demo[s]) for s in parts}
 
     # --- Stage 2: WHITEN the residual (PCA-whiten, TRAIN-only) -> W, Cov(W_train)~I ---
@@ -184,8 +145,6 @@ def evaluate(df):
     W = {s: pca.transform(Zprime[s]) for s in parts}
 
     # --- Stage 3: Stein moments over probes x orders; gamma TRAIN-only, then frozen ---
-    def with_t(s, t):
-        return np.hstack([demo[s], t[s][:, None]])
     cands = []
     for pname, T in build_probes():
         Tvals = {s: T(ys[s]) for s in parts}
@@ -197,8 +156,8 @@ def evaluate(df):
                 gamma = -gamma
                 t = {s: -t[s] for s in parts}
             signal = abs(np.corrcoef(t["train"], ys["train"])[0, 1])   # train "strength"
-            proxy = LinearRegression().fit(with_t("train", t), y_t["train"])
-            val_mae = mae_real(proxy, with_t("val", t), y_real["val"], lam)
+            proxy = LinearRegression().fit(with_score(demo, t, "train"), y_t["train"])
+            val_mae = mae_real(proxy, with_score(demo, t, "val"), y_real["val"], lam)
             cands.append({"probe": pname, "order": order,
                           "train_signal_abs_corr": float(signal),
                           "val_mae_days": float(val_mae), "t": t})
@@ -206,21 +165,14 @@ def evaluate(df):
     best = min(cands, key=lambda c: c["val_mae_days"])
     strongest = max(cands, key=lambda c: c["train_signal_abs_corr"])
     t = best["t"]
-    Xds = {s: with_t(s, t) for s in parts}
+    Xds = {s: with_score(demo, t, s) for s in parts}
 
     # --- Downstream a: LinearRegression on (X1, t) ---
     lr = LinearRegression().fit(Xds["train"], y_t["train"])
     lr_mae = {s: mae_real(lr, Xds[s], y_real[s], lam) for s in parts}
 
     # --- Downstream b: RandomForest on (X1, t), pick (n,d) by val MAE ---
-    rfbest = None
-    for n_est, depth in RF_GRID:
-        m = RandomForestRegressor(n_estimators=n_est, max_depth=depth,
-                                  random_state=SEED, n_jobs=-1).fit(Xds["train"], y_t["train"])
-        v = mae_real(m, Xds["val"], y_real["val"], lam)
-        if rfbest is None or v < rfbest[0]:
-            rfbest = (v, n_est, depth, m)
-    _, n_est, depth, rf = rfbest
+    rf, n_est, depth = best_rf_by_val(Xds, y_t["train"], y_real, lam)
     rf_mae = {s: mae_real(rf, Xds[s], y_real[s], lam) for s in parts}
 
     # strip the heavy 't' arrays before returning the candidate table
@@ -262,15 +214,7 @@ def selftest():
     for i in range(dim):
         base[f"emb_{i}"] = Z[:, i]
 
-    cats = lambda opts: rng.choice(opts, n)
-    df05a = pd.DataFrame({
-        "stay_id": sid, NUM_COL: rng.integers(18, 92, n).astype(float),
-        "first_careunit": cats(["MICU", "SICU"]), "gender": cats(["M", "F"]),
-        "admission_type": cats(["EW EMER.", "ELECTIVE"]), "insurance": cats(["Medicare", "Other"]),
-        "marital_status": cats(["SINGLE", "MARRIED"]), "race": cats(["WHITE", "BLACK"]),
-        "icu_los_days": rng.random(n), "outtime": "x",
-        "in_hospital_death": 0, "last_careunit": "z"})
-    df05a.loc[df05a["stay_id"] == "s0", "gender"] = np.nan
+    df05a = synthetic_demographics(rng, sid)
 
     asm = assemble(base, df05a)
     assert not {"icu_los_days", "outtime", "in_hospital_death",
