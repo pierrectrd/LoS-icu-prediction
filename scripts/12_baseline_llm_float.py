@@ -217,10 +217,14 @@ def assemble():
     log(f"assembling {len(records)} cached records")
     meta = pd.read_parquet(OUT_ROOT / f"{IN_NAME}.parquet")[
         ["stay_id", "subject_id", "split", "remaining_los_days"]]
+    # build_table inner-joins cache to 09b: stays no longer in 09b (in-hospital
+    # deaths, removed at 09b) are dropped here automatically -- no API calls.
     out = build_table(records, meta)
+    n_dropped_not_in_cohort = len(records) - len(out)
     out_path = OUT_ROOT / f"{STEP_NAME}.parquet"
     out.to_parquet(out_path, index=False)
-    log(f"wrote -> {out_path}  shape={out.shape}")
+    log(f"wrote -> {out_path}  shape={out.shape}  "
+        f"({n_dropped_not_in_cohort} cached stays dropped: not in death-free 09b)")
 
     s = score(out)
     log(f"dropped {s['n_null_dropped']} null-estimate rows from MAE")
@@ -238,7 +242,10 @@ def assemble():
         "system_prompt": SYSTEM_PROMPT, "user_template": USER_TEMPLATE,
         "temperature": 0, "temperature_dropped": temp_dropped,
         "cohort_cap_first_n": N_STAYS,
-        "n_stays_processed": int(len(records)),
+        "n_stays_cached": int(len(records)),
+        "n_stays_in_cohort": int(len(out)),
+        "cohort_note": "cache = first 10k of the OLD 09b; output = those that remain in "
+                       "the death-free 09b (survivors). In-hospital deaths removed at 09b.",
         "n_null_estimates": s["n_null_dropped"],
         "test_mae_days": s["test_mae"], "whole_mae_days": s["whole_mae"],
         "scoring": "MAE in real days, no transform (LLM emits days); null estimates dropped",

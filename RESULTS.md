@@ -1,5 +1,11 @@
 # Results so far — ICU remaining-LoS prediction
 
+> ⚠️ **Superseded & cohort-contaminated.** These 1,074-stay numbers were computed
+> *with in-hospital deaths still in the cohort* (a bug fixed later — deaths are
+> truncated by death, not discharge, and belong to the separate mortality task; they
+> are now removed at `09b`). They are also a tiny directional-only test fold. See
+> `RESULTS_10k.md` for the corrected, death-free results. Kept here for history only.
+
 **Cohort:** first 1,074 stays of the cohort (capped run — *directional only*, small
 test fold). Target: `remaining_los_days` after first 24h. Metric: **MAE in real
 days** (lower = better). Benchmark: MedM2T **2.31d**.

@@ -106,16 +106,25 @@ def selftest():
 
 # --------------------------------- real run ---------------------------------
 
-def main(max_stays=None):
+def main(max_stays=None, align_base=None):
     selftest()  # run the check before touching real data
 
     df09b = pd.read_parquet(OUT_ROOT / f"{TARGET_NAME}.parquet")
     df05a = pd.read_parquet(OUT_ROOT / f"{DEMO_NAME}.parquet")
     df = assemble(df09b, df05a)
-    if max_stays:
-        # cap to the first N stays, in 09b row order, so the cohort matches step 12
+    note = ""
+    if align_base:
+        # restrict to exactly the stays in another step's parquet (e.g. the step-12
+        # survivor cohort), so this baseline is on the SAME cohort as cases 1/2/5.
+        ids = set(pd.read_parquet(OUT_ROOT / f"{align_base}.parquet",
+                                  columns=["stay_id"])["stay_id"].astype(str))
+        df = df[df["stay_id"].astype(str).isin(ids)].copy()
+        note = f" (aligned to {align_base}: {len(df)} stays)"
+    elif max_stays:
+        # cap to the first N stays, in 09b row order
         df = df.head(max_stays)
-    log(f"assembled feature frame: {df.shape}" + (f" (capped to {max_stays})" if max_stays else ""))
+        note = f" (capped to {max_stays})"
+    log(f"assembled feature frame: {df.shape}{note}")
 
     res = evaluate(df)
 
@@ -135,6 +144,7 @@ def main(max_stays=None):
                    "demographics": str(OUT_ROOT / f"{DEMO_NAME}.parquet")},
         "case": "Case 3 reference: X-only (7 demographics) -> remaining_los_days",
         "max_stays": max_stays,
+        "align_base": align_base,
         "features_used": DEMO_COLS[1:],
         "medm2t_benchmark_mae_days": MEDM2T_MAE,
         **res,
@@ -147,6 +157,9 @@ def main(max_stays=None):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-stays", type=int, default=None,
-                    help="fit/evaluate on the first N stays only (default: all; use 10000 to match step 12)")
+                    help="fit/evaluate on the first N stays only (default: all)")
+    ap.add_argument("--align-base", type=str, default=None,
+                    help="restrict to the stay_ids in data/<NAME>.parquet "
+                         "(e.g. 12_baseline_llm_float) to match that cohort exactly")
     args = ap.parse_args()
-    main(max_stays=args.max_stays)
+    main(max_stays=args.max_stays, align_base=args.align_base)

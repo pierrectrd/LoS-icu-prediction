@@ -1,76 +1,108 @@
-# Results — 10,000-stay benchmark
+# Results — death-free survivor cohort (≈8.9k)
 
-Same four cases as `RESULTS.md`, now on **10,000 stays** (was 1,074). Cohort =
-first 10,000 stays of `09b` (contiguous head, same stays as before + 8,926 new).
-Split 6,304 train / 1,669 val / **2,027 test**. Metric: **test MAE in days**
-(lower = better). Benchmark: MedM2T **2.31**.
+> **Cohort correction (this supersedes the earlier numbers in this file).** Until
+> now, in-hospital deaths were never removed from the LoS cohort — only kept out of
+> the feature matrix. LoS for a patient who dies is truncated by *death*, not
+> *discharge*, so ~10.8% of every prior result mixed a time-to-death outcome into a
+> time-to-discharge task. Deaths are now excluded at the source (`09b`, survivors
+> only). Every number below is **re-run on the death-free cohort**; the old
+> death-contaminated values are shown in the last column for reference.
 
-## Test MAE — 10k vs 1,074
+Cohort = the **8,923 survivors** among the first 10,000 stays of the LLM cache
+(10,000 − 1,077 deaths). Patient-level split **5,618 train / 1,489 val / 1,816
+test**. Primary metric: **test MAE in days** (lower = better); Case 5 adds CRPS.
+Benchmark: MedM2T **2.31** (see comparability caveat).
 
-| Case | Method | Model | **10k test** | 1,074 test |
+## Test MAE — death-free vs death-contaminated
+
+| Case | Method | Model | **death-free test** | old (w/ deaths) |
 |------|--------|-------|:---:|:---:|
-| 3 | X only (demographics) | LR | 2.65 | 2.62 |
-| 3 | X only | RF | 2.64 | 2.67 |
-| 4 | Z only (LLM's own day estimate) | — | 2.82 | 2.57 |
-| **1** | **X + Z (1536-dim embedding)** | **RF** | **2.52** | 2.44 |
-| 1 | X + Z | Ridge | 2.53 | 2.49 |
-| 2 | X + 1 ridge-compressed score | LR | 2.53 | 2.68 |
-| 2 | X + 1 ridge-compressed score | RF | 2.58 | 2.72 |
-| 2b | X + 1 **literal Stein-moment** score | LR | 2.50 | — |
-| 2b | X + 1 literal Stein-moment score | RF | 2.51 | — |
+| 3 | X only (demographics) | LR | 2.49 | 2.65 |
+| 3 | X only | RF | 2.47 | 2.64 |
+| 4 | Z only (LLM's own day estimate) | — | 2.66 | 2.82 |
+| **1** | **X + Z (1536-dim embedding)** | **Ridge** | **2.356** | 2.53 |
+| 1 | X + Z | RF | 2.357 | 2.52 |
+| 2 | X + 1 ridge-compressed score | LR | 2.367 | 2.53 |
+| 2 | X + 1 ridge-compressed score | RF | 2.370 | 2.58 |
+| **2b** | **X + 1 literal Stein-moment score** | **LR** | **2.337** | 2.50 |
+| 2b | X + 1 literal Stein-moment score | RF | 2.354 | 2.51 |
+| 5 | DIM + IDR, Z only (median) | IDR | 2.409 | 2.58 |
+| 5 | DIM + IDR, X + Z (median) | IDR | 2.415 | 2.57 |
 
-**Best: Case 2b (literal Stein) — 2.50d**, edging Case 1 (X+Z) at 2.52d; all
-within fold noise, all above the 2.31 bar. Case 2b picked the probe `arctan(0.5y)`
-at first order (`scripts/14b_case2_stein_literal.py`).
+**Best: Case 2b (literal Stein) — 2.337d**, with Case 1 (X+Z, 2.356) and Case 2b RF
+(2.354) a hair behind; all clustered within fold noise and now **essentially at the
+MedM2T 2.31 bar** (best gap 0.03d). Case 5 (distributional) trails on point MAE
+(2.41) but is the only method giving calibrated CDFs and the least-overfit — its own
+section below.
 
-## What the 10× data changed
-- **The ranking held: Case 1 (X+Z) is best.** Adding the embedding still beats
-  X-only (2.52 vs 2.64) and beats the LLM's own number alone (2.82). The clinical
-  narrative carries signal demographics don't.
-- **The spread collapsed.** At n=1,074 the cases ranged 2.44–2.72; at 10k they sit
-  2.52–2.82. Most of the earlier separation was small-test-fold noise — the honest
-  gaps between methods are smaller than they looked.
-- **Case 4 (Z-alone) got worse** (2.57 → 2.82) and is now clearly the weakest. The
-  LLM's raw point estimate hedges toward the middle of the range; over a larger,
-  wider LoS sample that bias shows. Using the embedding *through a model* (Case 1)
-  is much better than trusting the LLM's number directly.
-- **Case 1's test MAE rose slightly** (2.44 → 2.52). The 1,074 number was an
-  optimistic estimate from a tiny test fold; 2.52 on 2,027 test stays is the more
-  trustworthy figure.
+## What removing the deaths changed
+- **Every method improved by ~0.15–0.20 d.** Deaths are short, death-truncated stays
+  the LoS models could never place correctly; they were pure noise/bias in the
+  target. Removing them is the single biggest accuracy jump in the project so far —
+  bigger than any modelling change — and it came from a **cohort-definition fix, not
+  a better model.**
+- **The ranking held.** X+Z (Case 1) still beats X-only (2.36 vs 2.47) and the LLM's
+  own number (2.66); the Stein compressions (Case 2/2b) remain marginally best on
+  point MAE. The embedding still carries signal demographics don't.
+- **Case 4 (Z-alone) is still the weakest** (2.66): the LLM's raw point estimate
+  hedges to the middle; using the embedding *through a model* is better.
+- **We are now at the MedM2T bar, not above it.** 2.34 vs 2.31. The remaining gap is
+  within fold noise on a 1,816-stay test fold (see caveats on bar comparability).
 
-## Overfitting — the interesting flip
-Train-vs-test gap for the random forests:
+## Overfitting
+Train-vs-test gap for the random forests / IDR (death-free):
 
-| Case | Model | Train | Test | Gap | (1,074 gap) |
-|------|-------|:---:|:---:|:---:|:---:|
-| 1 | RF | 1.28 | 2.52 | **1.24** | 1.11 |
-| 2 | RF | 2.02 | 2.58 | **0.55** | 1.48 |
-| 2b | RF | 2.17 | 2.51 | **0.33** | — |
+| Case | Model | Train | Test | Gap |
+|------|-------|:---:|:---:|:---:|
+| 1 | RF | 1.16 | 2.36 | **1.19** |
+| 2 | RF | 1.83 | 2.37 | **0.54** |
+| 2b | RF | 1.98 | 2.35 | **0.38** |
+| 5 | IDR (Z-only) | 2.10 | 2.41 | **0.31** |
 
-- **Case 1 RF still overfits** (gap 1.24): even with 10× data, the 1536 embedding
-  columns + demographic one-hots give the forest room to memorize training stays.
-- **Case 2's compression now controls it** (gap 0.55, down from 1.48). At 1,074 the
-  Stein score looked *more* overfit than Case 1 — that was noise. With real data the
-  one-number compression does what it was designed to do: it kills the overfitting.
-- **But the ridge-score Case 2 doesn't win on test** (2.58 vs Case 1's 2.52). So
-  *that* compression buys generalization stability at the cost of a hair of accuracy.
-- **Case 2b (literal Stein moment) gets both** (gap 0.33, test 2.51): finding the
-  single direction via an explicit Stein moment over probes — rather than a ridge
-  regression — keeps essentially all of Case 1's signal *and* overfits the least of
-  any model. First order dominated (second-order Hessian moment carried almost no
-  signal), and the bounded probes collapsed to ~linear, so the usable narrative
-  signal is close to a single linear index. Marginal on test, but the best-behaved.
+- **Case 1 RF still overfits hardest** (gap 1.19): the 1536 embedding columns +
+  demographic one-hots give the forest room to memorise training stays, undiminished
+  by the cleaner cohort.
+- **Compression controls it** (Case 2 → 0.54, Case 2b → 0.38) and **IDR controls it
+  most** (0.31): squeezing to a 1-D index + a tuning-free isotonic fit is the
+  strongest regulariser of the lot.
 
-## Takeaways for next steps
-- Case 1 (X+Z) is the architecture to keep developing.
-- Case 1's residual overfitting is in the **demographics + raw 1536-dim Z**, not
-  fixed by data volume alone → motivates the next objective, **Double Machine
-  Learning** (orthogonalize Z against X with flexible nuisance models), which is a
-  principled version of what Case 2's residualize-then-compress was reaching for.
-- 2.52 vs MedM2T 2.31: closing, not closed. The full 51,704 cohort is the next lever.
+## Case 5 — distributional forecasts (DIM + IDR)
+First **distributional** method (`scripts/16_idr_dim.py`): a Distributional Index
+Model + Isotonic Distributional Regression wrapper around the LLM embedding. Stage 1
+fits a Ridge **index** g(x) (α picked by val CRPS); stage 2 feeds (index, real days)
+to IDR, which returns a full predictive CDF per patient, monotone in the index. Two
+settings: **A = embedding only (Z)**, **B = Z + demographics (X)**. Metrics: CRPS
+(distributional) and MAE of the predictive **median** (point, comparable above). IDR
+via `sklearn.isotonic` (1-D PAVA) — equivalent to the repo's Rust IDR for a scalar
+index; the vendored binding is unbuildable in this Py-3.10 venv.
+
+| Setting | α | CRPS train | CRPS val | **CRPS test** | MAE train | MAE val | **MAE test** |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| A — Z only | 1000 | 1.61 | 1.69 | **1.87** | 2.10 | 2.18 | **2.41** |
+| B — X + Z | 1000 | 1.60 | 1.70 | **1.87** | 2.09 | 2.19 | **2.42** |
+
+- **Embedding-only ≈ embedding+demographics.** A and B are tied (CRPS 1.870 vs 1.866;
+  MAE 2.409 vs 2.415). Adding structured demographics X on top of Z buys nothing —
+  the demographics were already fed through the LLM and are **baked into Z**. Setting
+  A is not as information-poor as it looks.
+- **Least-overfit method we have** (MAE gap ~0.31, CRPS gap ~0.23).
+- **Competitive point predictor.** Median-MAE 2.41 beats X-only (2.47) and the LLM's
+  own number (2.66), just behind the best point models (Case 1/2b ≈ 2.34–2.36). The
+  win is *calibrated distributions*, not a lower MAE.
+- **CRPS is not on the MAE ruler.** The 1.87 CRPS scores whole distributions; not
+  comparable to the 2.31 bar or the point-MAE rows. Only the median-MAE column is.
 
 ## Caveats
-- Still a contiguous head(10,000) of `09b`, not a random sample — kept comparable to
-  the 1,074 runs. Full-cohort run is a separate objective.
+- **Cohort is a contiguous head, not a random sample**: the 8,923 survivors of the
+  first 10,000 stays of `09b` (kept comparable to earlier runs). A full-cohort run
+  (46,203 survivors) is a separate objective.
+- **MedM2T 2.31 bar comparability**: their cohort's death handling and sampling may
+  differ from ours (now death-free) — treat the 2.31 as an indicative bar, not an
+  exact apples-to-apples target.
 - **LLM contamination** unaddressed: the model may have seen MIMIC in pretraining.
-- 1,074-stay manifests preserved in `data/_benchmark_1074/`; `RESULTS.md` unchanged.
+- **The death fix is the headline**: the ~0.18 d gain is a data-correctness gain, not
+  a modelling gain. It also retroactively explains some earlier oddities (e.g. Case 4
+  looking unusually weak with deaths in).
+- Death-contaminated 10k manifests/numbers are superseded; 1,074-stay manifests
+  preserved in `data/_benchmark_1074/`; `RESULTS.md` (1,074-era) is also
+  death-contaminated — see its banner.
